@@ -8,7 +8,6 @@ from __future__ import print_function
 import numpy as np
 import pandas as pd
 
-
 def create_sharpe_ratio(returns, periods=252):
     """
     Create the Sharpe ratio for the strategy, based on a 
@@ -18,8 +17,8 @@ def create_sharpe_ratio(returns, periods=252):
     returns - A pandas Series representing period percentage returns.
     periods - Daily (252), Hourly (252*6.5), Minutely(252*6.5*60) etc.
     """
+    if np.std(returns) == 0: return 0.0
     return np.sqrt(periods) * (np.mean(returns)) / np.std(returns)
-
 
 def create_drawdowns(pnl):
     """
@@ -33,19 +32,23 @@ def create_drawdowns(pnl):
     Returns:
     drawdown, duration - Highest peak-to-trough drawdown and duration.
     """
-
-    # Calculate the cumulative returns curve 
-    # and set up the High Water Mark
-    hwm = [0]
-
-    # Create the drawdown and duration series
-    idx = pnl.index
-    drawdown = pd.Series(index = idx)
-    duration = pd.Series(index = idx)
-
-    # Loop over the index range
-    for t in range(1, len(idx)):
-        hwm.append(max(hwm[t-1], pnl[t]))
-        drawdown[t]= (hwm[t]-pnl[t])
-        duration[t]= (0 if drawdown[t] == 0 else duration[t-1]+1)
-    return drawdown, drawdown.max(), duration.max()
+    # Convert to np array if a pd Series because it is faster
+    if isinstance(pnl, pd.Series):
+        idx = pnl.index
+        pnl_array = pnl.values
+    else:
+        pnl_array = pnl
+        idx = pd.RangeIndex(len(pnl_array))
+    
+    hwm_array = np.zeros(len(pnl_array))
+    drawdown_array = np.zeros(len(pnl_array))
+    duration_array = np.zeros(len(pnl_array), dtype=int)
+    
+    for t in range(1, len(pnl_array)):
+        hwm_array[t] = max(hwm_array[t-1], pnl_array[t])
+        drawdown_array[t] = hwm_array[t] - pnl_array[t]
+        duration_array[t] = 0 if drawdown_array[t] == 0 else duration_array[t-1] + 1
+    
+    drawdown = pd.Series(drawdown_array, index=idx)
+    
+    return drawdown, drawdown.max(), max(duration_array)

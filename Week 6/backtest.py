@@ -111,7 +111,7 @@ class Backtest(object):
                             self.fills += 1
                             self.portfolio.update_fill(event)
 
-            time.sleep(self.heartbeat)
+            # time.sleep(self.heartbeat)
 
     def _output_performance(self):
         """

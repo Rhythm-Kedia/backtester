@@ -6,9 +6,10 @@
 from __future__ import print_function
 
 import datetime
+from unittest.mock import call
 
 import numpy as np
-import time
+import pandas as pd
 
 from strategy import Strategy
 from event import SignalEvent
@@ -16,6 +17,23 @@ from backtest import Backtest
 from data import HistoricCSVDataHandler
 from execution import SimulatedExecutionHandler
 from portfolio import Portfolio
+from numba import njit
+
+@njit(cache=True)
+def calculate_sma_batch(prices, short_window, long_window):
+    """Calculate both SMAs in one pass"""
+    if len(prices) < long_window:
+        return 0.0, 0.0
+    # Numba is very efficient with explicit loops
+    short_sum = 0.0
+    for i in range(1, short_window + 1):
+        short_sum += prices[-i]
+    
+    long_sum = short_sum # Start with short_sum to avoid re-calculating
+    for i in range(short_window + 1, long_window + 1):
+        long_sum += prices[-i]
+        
+    return short_sum / short_window, long_sum / long_window
 
 
 class MovingAverageCrossStrategy(Strategy):
@@ -71,12 +89,13 @@ class MovingAverageCrossStrategy(Strategy):
                     s, "adj_close", N=self.long_window
                 )
                 bar_date = self.bars.get_latest_bar_datetime(s)
-                if bars is not None and len(bars) > 0:
-                    short_sma = np.mean(bars[-self.short_window:])
-                    long_sma = np.mean(bars[-self.long_window:])
+                if bars is not None and len(bars) >= self.long_window:
+                    short_sma, long_sma = calculate_sma_batch(
+                        bars, self.short_window, self.long_window
+                    )
 
                     symbol = s
-                    dt = datetime.datetime.utcnow()
+                    dt = datetime.datetime.now(datetime.UTC)
                     sig_dir = ""
 
                     if short_sma > long_sma and self.bought[s] == "OUT":
@@ -86,26 +105,28 @@ class MovingAverageCrossStrategy(Strategy):
                         self.events.put(signal)
                         self.bought[s] = 'LONG'
                     elif short_sma < long_sma and self.bought[s] == "LONG":
-                        print("SHORT: %s" % bar_date)
+                        print("EXIT: %s" % bar_date)
                         sig_dir = 'EXIT'
                         signal = SignalEvent(1, symbol, dt, sig_dir, 1.0)
                         self.events.put(signal)
                         self.bought[s] = 'OUT'
 
 
+import time
 if __name__ == "__main__":
-    csv_dir = '.'  # CHANGE THIS!
+    csv_dir = '.'
+    # BIG_AAPL is a generated data using gen_data.py
+    # to check the speed up obtained by Numba
     symbol_list = ['BIG_AAPL']
     initial_capital = 100000.0
     heartbeat = 0.0
     start_date = datetime.datetime(1990, 1, 1, 0, 0, 0)
-
-    start_time = time.time() 
+    start_time = time.time()
     backtest = Backtest(
         csv_dir, symbol_list, initial_capital, heartbeat, 
         start_date, HistoricCSVDataHandler, SimulatedExecutionHandler, 
         Portfolio, MovingAverageCrossStrategy
     )
     backtest.simulate_trading()
-    end_time = time.time()
-    print("Backtest completed in %.2f seconds." % (end_time - start_time))
+    end_time  = time.time()
+    print("Total time taken: %s seconds" % (end_time - start_time))

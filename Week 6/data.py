@@ -11,6 +11,7 @@ import os, os.path
 
 import numpy as np
 import pandas as pd
+from numba import njit
 
 from event import MarketEvent
 
@@ -102,129 +103,187 @@ class HistoricCSVDataHandler(DataHandler):
         self.csv_dir = csv_dir
         self.symbol_list = symbol_list
 
-        self.symbol_data = {}
-        self.latest_symbol_data = {}
-        self.continue_backtest = True       
-        self.bar_index = 0
+        # Optimization: Use only array-based storage
+        self._data_arrays = {}
+        self._current_index = {s: -1 for s in symbol_list}  # Current bar index for each symbol
+        self.continue_backtest = True
+        
+        # Cache for windowed values
+        self._value_cache = {}
 
-        self._open_convert_csv_files()
+        # Load all data as optimized arrays
+        self._load_data_arrays()
 
-    def _open_convert_csv_files(self):
+    def _load_data_arrays(self):
         """
-        Opens the CSV files from the data directory, converting
-        them into pandas DataFrames within a symbol dictionary.
-
-        For this handler it will be assumed that the data is
-        taken from Yahoo. Thus its format will be respected.
+        Load all CSV data directly into NumPy arrays for maximum performance.
         """
+        # Find common date index across all symbols
         comb_index = None
+        symbol_dfs = {}
+        
         for s in self.symbol_list:
-            # Load the CSV file with no header information, indexed on date
-            self.symbol_data[s] = pd.read_csv(
+            # Load CSV file
+            df = pd.read_csv(
                 os.path.join(self.csv_dir, '%s.csv' % s),
                 header=0, index_col=0, parse_dates=True,
-                names=[
-                    'datetime', 'open', 'high', 
-                    'low', 'close', 'volume', 'adj_close'
-                ]
+                names=['datetime', 'open', 'high', 'low', 'close', 'volume', 'adj_close']
             ).sort_index()
-
-            # Combine the index to pad forward values
+            
+            symbol_dfs[s] = df
+            
+            # Combine indexes
             if comb_index is None:
-                comb_index = self.symbol_data[s].index
+                comb_index = df.index
             else:
-                comb_index = comb_index.union(self.symbol_data[s].index)
-
-            # Set the latest symbol_data to None
-            self.latest_symbol_data[s] = []
-
-        # Reindex the dataframes
+                comb_index = comb_index.union(df.index)
+        
+        # Reindex all dataframes and convert to arrays
         for s in self.symbol_list:
-            df = self.symbol_data[s].reindex(index=comb_index, method='pad')
+            df = symbol_dfs[s].reindex(index=comb_index, method='pad')
             df["returns"] = df["close"].pct_change()
-            self.symbol_data[s] = df.iterrows()
+            
+            # Store as NumPy arrays for fast access
+            self._data_arrays[s] = {
+                'datetime': df.index.values,
+                'open': df['open'].values,
+                'high': df['high'].values,
+                'low': df['low'].values,
+                'close': df['close'].values,
+                'volume': df['volume'].values,
+                'adj_close': df['adj_close'].values,
+                'returns': df['returns'].values
+            }
 
-    def _get_new_bar(self, symbol):
+    def update_bars(self):
         """
-        Returns the latest bar from the data feed.
+        Optimized bar update using direct index manipulation.
+        Advances current index for each symbol instead of using generators.
         """
-        for b in self.symbol_data[symbol]:
-            yield b
+        all_stopped = True
+        for s in self.symbol_list:
+            max_idx = len(self._data_arrays[s]['close']) - 1
+            if self._current_index[s] < max_idx:
+                self._current_index[s] += 1
+                all_stopped = False
+            
+        if all_stopped:
+            self.continue_backtest = False
+        else:
+            self.events.put(MarketEvent())
 
     def get_latest_bar(self, symbol):
         """
         Returns the last bar from the latest_symbol list.
+        Optimized to use array access.
         """
-        try:
-            bars_list = self.latest_symbol_data[symbol]
-        except KeyError:
-            print("That symbol is not available in the historical data set.")
-            raise
-        else:
-            return bars_list[-1]
+        idx = self._current_index[symbol]
+        if idx < 0:
+            raise Exception(f"No bars available for {symbol}")
+        
+        # Return in same format as before for compatibility
+        dt = self._data_arrays[symbol]['datetime'][idx]
+        
+        # Create a pandas Series-like object for compatibility
+        class BarData:
+            def __init__(self, data_dict):
+                for k, v in data_dict.items():
+                    setattr(self, k, v)
+        
+        bar_data = BarData({
+            'open': self._data_arrays[symbol]['open'][idx],
+            'high': self._data_arrays[symbol]['high'][idx],
+            'low': self._data_arrays[symbol]['low'][idx],
+            'close': self._data_arrays[symbol]['close'][idx],
+            'volume': self._data_arrays[symbol]['volume'][idx],
+            'adj_close': self._data_arrays[symbol]['adj_close'][idx],
+            'returns': self._data_arrays[symbol]['returns'][idx]
+        })
+        
+        return (dt, bar_data)
 
     def get_latest_bars(self, symbol, N=1):
         """
         Returns the last N bars from the latest_symbol list,
-        or N-k if less available.
+        or N-k if less available. Optimized array access.
         """
-        try:
-            bars_list = self.latest_symbol_data[symbol]
-        except KeyError:
-            print("That symbol is not available in the historical data set.")
-            raise
-        else:
-            return bars_list[-N:]
+        idx = self._current_index[symbol]
+        if idx < 0:
+            return []
+            
+        start_idx = max(0, idx - N + 1)
+        bars = []
+        
+        for i in range(start_idx, idx + 1):
+            dt = self._data_arrays[symbol]['datetime'][i]
+            
+            class BarData:
+                def __init__(self, data_dict):
+                    for k, v in data_dict.items():
+                        setattr(self, k, v)
+            
+            bar_data = BarData({
+                'open': self._data_arrays[symbol]['open'][i],
+                'high': self._data_arrays[symbol]['high'][i],
+                'low': self._data_arrays[symbol]['low'][i],
+                'close': self._data_arrays[symbol]['close'][i],
+                'volume': self._data_arrays[symbol]['volume'][i],
+                'adj_close': self._data_arrays[symbol]['adj_close'][i],
+                'returns': self._data_arrays[symbol]['returns'][i]
+            })
+            
+            bars.append((dt, bar_data))
+        
+        return bars
 
     def get_latest_bar_datetime(self, symbol):
         """
         Returns a Python datetime object for the last bar.
         """
-        try:
-            bars_list = self.latest_symbol_data[symbol]
-        except KeyError:
-            print("That symbol is not available in the historical data set.")
-            raise
-        else:
-            return bars_list[-1][0]
+        idx = self._current_index[symbol]
+        if idx < 0:
+            raise Exception(f"No bars available for {symbol}")
+        return self._data_arrays[symbol]['datetime'][idx]
 
     def get_latest_bar_value(self, symbol, val_type):
         """
         Returns one of the Open, High, Low, Close, Volume or OI
         values from the pandas Bar series object.
         """
-        try:
-            bars_list = self.latest_symbol_data[symbol]
-        except KeyError:
-            print("That symbol is not available in the historical data set.")
-            raise
-        else:
-            return getattr(bars_list[-1][1], val_type)
+        idx = self._current_index[symbol]
+        if idx < 0:
+            raise Exception(f"No bars available for {symbol}")
+        return self._data_arrays[symbol][val_type][idx]
+
+    @staticmethod
+    @njit(cache=True)
+    def _get_latest_values_numba(array, current_idx, N):
+        """Numba-optimized function to get N latest values from array."""
+        start_idx = max(0, current_idx - N + 1)
+        return array[start_idx:current_idx + 1]
 
     def get_latest_bars_values(self, symbol, val_type, N=1):
         """
-        Returns the last N bar values from the 
-        latest_symbol list, or N-k if less available.
+        Returns the last N bar values from the latest_symbol list, or N-k if less available.
+        Uses optimized NumPy arrays with Numba acceleration and caching.
         """
-        try:
-            bars_list = self.get_latest_bars(symbol, N)
-        except KeyError:
-            print("That symbol is not available in the historical data set.")
-            raise
-        else:
-            return np.array([getattr(b[1], val_type) for b in bars_list])
+        cache_key = f"{symbol}_{val_type}_{N}_{self._current_index[symbol]}"
+        if cache_key in self._value_cache:
+            return self._value_cache[cache_key]
 
-    def update_bars(self):
-        """
-        Pushes the latest bar to the latest_symbol_data structure
-        for all symbols in the symbol list.
-        """
-        for s in self.symbol_list:
-            try:
-                bar = next(self._get_new_bar(s))
-            except StopIteration:
-                self.continue_backtest = False
-            else:
-                if bar is not None:
-                    self.latest_symbol_data[s].append(bar)
-        self.events.put(MarketEvent())
+        idx = self._current_index[symbol]
+        if idx < 0:
+            return np.array([])
+        
+        # Use Numba-accelerated function for fast array slicing
+        result = self._get_latest_values_numba(
+            self._data_arrays[symbol][val_type], 
+            idx, 
+            N
+        )
+        
+        # Cache only for common lookback periods
+        if N in (50, 100, 200, 400):
+            self._value_cache[cache_key] = result
+            
+        return result
